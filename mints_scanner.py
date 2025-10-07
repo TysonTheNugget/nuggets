@@ -44,15 +44,37 @@ retries = Retry(total=3, backoff_factor=0.4, status_forcelist=[429, 500, 502, 50
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 # ---------------------------
-# JSONBin helpers (robust)
+# Utils
 # ---------------------------
 def _log_preview(thing, limit=200):
     try:
-        s = thing if isinstance(thing, str) else json.dumps(thing)  # may raise for bytes/etc.
+        s = thing if isinstance(thing, str) else json.dumps(thing)
         return s[:limit]
     except Exception:
         return f"<unprintable:{type(thing)}>"
 
+def _sanitize_mints_list(mints):
+    """Return only dict items; attempt to parse JSON strings into dicts; drop anything else."""
+    cleaned = []
+    for m in (mints or []):
+        if isinstance(m, dict):
+            cleaned.append(m)
+        elif isinstance(m, str):
+            try:
+                obj = json.loads(m)
+                if isinstance(obj, dict):
+                    cleaned.append(obj)
+            except Exception:
+                continue
+        # ignore ints/None/other
+    return cleaned
+
+def _safe_confirmed_at(x):
+    return x.get("confirmedAt", 0) if isinstance(x, dict) else 0
+
+# ---------------------------
+# JSONBin helpers (robust)
+# ---------------------------
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_jsonbin():
     try:
@@ -66,31 +88,18 @@ def get_jsonbin():
         logger.debug(f"[JSONBin] Raw type={type(data)} preview={_log_preview(data)}")
 
         # JSONBin v3 typically returns {"record": ...}
-        record = None
-        if isinstance(data, dict) and "record" in data:
-            record = data["record"]
-        else:
-            record = data
+        record = data.get("record") if isinstance(data, dict) else data
 
-        # Normalize: record may be dict or list
         if isinstance(record, dict):
-            # Your schema stored as {"mints":[...]} — keep that path
             mints = record.get("mints", [])
-            if isinstance(mints, list):
-                return mints
-            # If someone stored the list directly under the bin:
-            if "mints" not in record:
-                # permissive: if dict isn't your schema, treat as empty
-                logger.warning("[JSONBin] Dict without 'mints' key; returning empty list")
-                return []
-            logger.warning("[JSONBin] 'mints' exists but is not a list; returning empty list")
-            return []
         elif isinstance(record, list):
-            # If the bin itself is a list, use it directly (assume it's the mints list)
-            return record
+            mints = record
         else:
             logger.warning(f"[JSONBin] Unsupported top-level type: {type(record)}; returning empty list")
-            return []
+            mints = []
+
+        mints = _sanitize_mints_list(mints)
+        return mints
     except Exception as e:
         logger.error(f"[JSONBin] Error reading bin: {e}")
         return []
@@ -98,7 +107,9 @@ def get_jsonbin():
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def update_jsonbin(mints):
     try:
-        payload = {"mints": mints}
+        # write only sanitized dicts
+        safe = _sanitize_mints_list(mints)
+        payload = {"mints": safe}
         r = session.put(
             JSONBIN_URL_WRITE,
             headers={"X-Master-Key": JSONBIN_MASTER_KEY, "Content-Type": "application/json"},
@@ -106,7 +117,7 @@ def update_jsonbin(mints):
             timeout=15
         )
         r.raise_for_status()
-        logger.info("[JSONBin] Updated bin with %d mints", len(mints))
+        logger.info("[JSONBin] Updated bin with %d mints", len(safe))
         return True
     except Exception as e:
         logger.error(f"[JSONBin] Error updating bin: {e}")
@@ -115,7 +126,6 @@ def update_jsonbin(mints):
 # ---------------------------
 # Bitcoin transaction helpers
 # ---------------------------
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def fetch_mempool_txs():
     try:
@@ -130,13 +140,10 @@ def fetch_mempool_txs():
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def fetch_tx_detail_mempool(txid: str):
-    """Hydrate a txid into a full tx object with vout/status via mempool.space."""
     try:
         r = session.get(f"{MEMPOOL}/tx/{txid}", timeout=20)
         r.raise_for_status()
-        j = r.json()
-        # Normalize: mempool /tx/{txid} returns fields 'txid','status','vin','vout', etc.
-        return j
+        return r.json()
     except Exception as e:
         logger.error(f"[Mempool] Error fetching tx detail for {txid}: {e}")
         return None
@@ -152,11 +159,9 @@ def _blockchair_fetch_txids_dashboards(address, limit=100, max_pages=10, pause=0
                 params["key"] = BLOCKCHAIR_API_KEY
             r = session.get(url, params=params, timeout=30)
             if r.status_code == 429:
-                time.sleep(1.0)
-                continue
+                time.sleep(1.0); continue
             r.raise_for_status()
             j = r.json()
-            # structure: {"data": { "<address>": { "transactions": [ ...txids... ], ... } } }
             data_for_addr = j.get("data", {}).get(address, {})
             page_txids = data_for_addr.get("transactions", [])
             if not page_txids:
@@ -182,8 +187,7 @@ def _blockchair_fetch_txids_outputs(address, limit=100, max_pages=10, pause=0.25
                 params["key"] = BLOCKCHAIR_API_KEY
             r = session.get(url, params=params, timeout=30)
             if r.status_code == 429:
-                time.sleep(1.0)
-                continue
+                time.sleep(1.0); continue
             r.raise_for_status()
             j = r.json()
             rows = j.get("data", [])
@@ -209,21 +213,12 @@ def _blockchair_fetch_txids_outputs(address, limit=100, max_pages=10, pause=0.25
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def fetch_chain_txs(pages=100, limit=100):
-    """
-    Returns a list of full tx objects (with vout/status) for the address,
-    limited by SCAN_SINCE_UNIX on the caller.
-    """
-    # Try dashboards first
     txids = _blockchair_fetch_txids_dashboards(BITCOIN_ADDRESS, limit=limit, max_pages=pages)
     if not txids:
-        # Fallback to outputs recipient()
         txids = _blockchair_fetch_txids_outputs(BITCOIN_ADDRESS, limit=limit, max_pages=pages)
-
     if not txids:
         logger.info("[Blockchair] No txids found for address.")
         return []
-
-    # Hydrate via mempool.space
     txs = []
     for txid in txids:
         tx = fetch_tx_detail_mempool(txid)
@@ -237,9 +232,7 @@ def get_outspends(txid):
     try:
         r = session.get(f"{MEMPOOL}/tx/{txid}/outspends", timeout=15)
         r.raise_for_status()
-        data = r.json()
-        logger.debug(f"[Mempool] Outspends for {txid}: {data}")
-        return data
+        return r.json()
     except Exception as e:
         logger.error(f"[Mempool] Error fetching outspends for {txid}: {e}")
         return None
@@ -274,12 +267,12 @@ def parse_png_text(buf):
     text = {}
     off = 8
     while off + 8 <= len(buf):
-        if off + 8 > len(buf): break
         len_chunk = int.from_bytes(buf[off:off+4], "big")
         off += 4
         type_chunk = buf[off:off+4].decode("latin1")
         off += 4
-        if off + len_chunk > len(buf): break
+        if off + len_chunk > len(buf):
+            break
         data = buf[off:off+len_chunk]
         off += len_chunk
         off += 4  # Skip CRC
@@ -359,13 +352,13 @@ def find_png_inscription_id(txid, max_index=5):
 # ---------------------------
 def scan_transactions(initial=False):
     mints = get_jsonbin() if not initial else []
+    mints = _sanitize_mints_list(mints)  # extra safety
     seen_set = {m.get("txid") for m in mints if isinstance(m, dict)}
     txs = []
 
     if initial:
         logger.info("[Scan] Performing initial full scan...")
         chain_txs = fetch_chain_txs(pages=100, limit=100)
-        # Filter by SCAN_SINCE_UNIX (if status/block_time present)
         txs = [t for t in chain_txs if isinstance(t, dict) and t.get("status", {}).get("block_time", 0) >= SCAN_SINCE_UNIX]
     else:
         logger.info("[Scan] Scanning mempool for updates...")
@@ -376,7 +369,6 @@ def scan_transactions(initial=False):
         txid = tx.get("txid")
         if not txid or txid in seen_set:
             continue
-
         try:
             outspends = get_outspends(txid)
             if not outspends:
@@ -406,7 +398,6 @@ def scan_transactions(initial=False):
             serial = (get_case_insensitive(text_map, PNG_TEXT_KEY_HINT) or
                       maybe_serial_from_json_values(text_map) or
                       find_alnum_token(' '.join([str(v) for v in text_map.values() if isinstance(v, str)])))
-
             if not serial:
                 continue
 
@@ -434,18 +425,19 @@ def scan_transactions(initial=False):
             seen_set.add(txid)
             new_mints += 1
             logger.debug(f"[Scan] Added mint: {serial} for tx {txid}")
-
         except Exception as e:
             logger.error(f"[Scan] Error processing tx {txid}: {e}")
 
     logger.info(f"[Scan] Processed {len(txs)} txs, found {new_mints} new mints")
-    mints.sort(key=lambda x: x.get("confirmedAt", 0), reverse=True)
+    # SAFE sort and write
+    mints = _sanitize_mints_list(mints)
+    mints.sort(key=_safe_confirmed_at, reverse=True)
     if mints:
         update_jsonbin(mints)
     return mints
 
 # ---------------------------
-# Scheduler to update JSONBin every 30 seconds
+# Scheduler
 # ---------------------------
 def update_mints_job():
     try:
@@ -471,12 +463,8 @@ logger.info("[Scheduler] Started: updating JSONBin every 30s")
 @app.route('/mints')
 def mints():
     try:
-        mints = get_jsonbin()
-        return jsonify({
-            "ok": True,
-            "mints": mints,
-            "total": len(mints)
-        })
+        m = get_jsonbin()
+        return jsonify({"ok": True, "mints": m, "total": len(m)})
     except Exception as e:
         logger.error(f"[Mints] Error serving mints: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -484,11 +472,11 @@ def mints():
 @app.route('/debug')
 def debug():
     try:
-        mints = get_jsonbin()
+        m = get_jsonbin()
         return jsonify({
-            "total_mints": len(mints),
-            "sample_mint": mints[0] if mints else None,
-            "jsonbin_status": "updated" if mints else "empty"
+            "total_mints": len(m),
+            "sample_mint": m[0] if m else None,
+            "jsonbin_status": "updated" if m else "empty"
         })
     except Exception as e:
         logger.error(f"[Debug] Error: {e}")
