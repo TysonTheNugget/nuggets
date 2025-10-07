@@ -26,7 +26,7 @@ SINGLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static',
 os.makedirs(SINGLES_DIR, exist_ok=True)
 MEMPOOL = "https://mempool.space/api"
 BLOCKCHAIR = "https://api.blockchair.com/bitcoin"
-SCAN_SINCE_UNIX = int(os.getenv("SCAN_SINCE_UNIX", "1724803200"))  # Aug 27, 2025 00:00:00 UTC
+SCAN_SINCE_UNIX = int(os.getenv("SCAN_SINCE_UNIX", "1728284400"))  # Oct 7, 2025 00:00:00 UTC
 PNG_TEXT_KEY_HINT = os.getenv("PNG_TEXT_KEY_HINT", "Serial")
 CONTENT_HOSTS = [
     "https://static.unisat.io/content",
@@ -51,7 +51,13 @@ def get_jsonbin():
         )
         r.raise_for_status()
         data = r.json()
-        return data.get("record", {}).get("mints", [])
+        logger.debug(f"[JSONBin] Raw response: {data}")
+        # Handle both dict and list responses
+        if isinstance(data, dict):
+            return data.get("record", {}).get("mints", [])
+        elif isinstance(data, list):
+            return data
+        return []
     except Exception as e:
         logger.error(f"[JSONBin] Error reading bin: {e}")
         return []
@@ -78,20 +84,23 @@ def fetch_mempool_txs():
     try:
         r = session.get(f"{MEMPOOL}/address/{BITCOIN_ADDRESS}/txs/mempool", timeout=10)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        logger.debug(f"[Mempool] Raw response: {data}")
+        return data
     except Exception as e:
         logger.error(f"[Mempool] Error fetching mempool txs: {e}")
         return []
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def fetch_chain_txs(pages=50):
+def fetch_chain_txs(pages=100):
     txs = []
     for page in range(pages):
         try:
-            url = f"{BLOCKCHAIR}/transactions?recipient={BITCOIN_ADDRESS}&offset={page * 100}&key={BLOCKCHAIR_API_KEY}"
+            url = f"{BLOCKCHAIR}/transactions?q=recipient({BITCOIN_ADDRESS})&offset={page * 100}&key={BLOCKCHAIR_API_KEY}"
             r = session.get(url, timeout=30)
             r.raise_for_status()
             data = r.json()
+            logger.debug(f"[Blockchair] Page {page} response: {data}")
             page_txs = data.get("data", [])
             txs.extend(page_txs)
             if len(page_txs) < 100:
@@ -106,7 +115,9 @@ def get_outspends(txid):
     try:
         r = session.get(f"{MEMPOOL}/tx/{txid}/outspends", timeout=10)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        logger.debug(f"[Mempool] Outspends for {txid}: {data}")
+        return data
     except Exception as e:
         logger.error(f"[Mempool] Error fetching outspends for {txid}: {e}")
         return None
@@ -227,7 +238,7 @@ def scan_transactions(initial=False):
     
     if initial:
         logger.info("[Scan] Performing initial full scan...")
-        chain_txs = fetch_chain_txs(pages=50)  # Adjust pages as needed
+        chain_txs = fetch_chain_txs(pages=100)
         txs = [t for t in chain_txs if t.get("status", {}).get("block_time", 0) >= SCAN_SINCE_UNIX]
     else:
         logger.info("[Scan] Scanning mempool for updates...")
@@ -254,7 +265,7 @@ def scan_transactions(initial=False):
             
             uniq_candidates = list(set(candidates))
             inscription_id = None
-            for reveal_txid in uniq_candidates[:1]:  # Limit to first candidate
+            for reveal_txid in uniq_candidates[:1]:
                 inscription_id = find_png_inscription_id(reveal_txid)
                 if inscription_id:
                     break
