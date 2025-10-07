@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ねこねこ · Mint History</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .history-item {
+            transition: all 0.3s ease;
+        }
+        .history-item:hover {
+            background-color: #f3e8ff;
+        }
+        .image-preview {
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        .image-preview:hover .enlarged-image {
+            display: block;
+        }
+        .enlarged-image {
+            display: none;
+            position: absolute;
+            z-index: 10;
+            top: -100px;
+            left: 50px;
+            width: 256px;
+            height: 256px;
+            object-fit: contain;
+            border: 2px solid #6b7280;
+            border-radius: 8px;
+            background: white;
+            padding: 8px;
+        }
+        .download-btn {
+            display: none;
+            position: absolute;
+            bottom: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #8b5cf6;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-size: 12px;
+        }
+        .image-preview:hover .download-btn {
+            display: block;
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-4 max-w-4xl">
+        <h1 class="text-3xl font-bold text-purple-600 mb-6 text-center">
+            ねこねこ Mint History
+        </h1>
+        <p class="text-center text-gray-600 mb-8">
+            Latest mints from the ねこねこ collection
+        </p>
+        <div class="bg-white rounded-lg shadow-lg">
+            {% for mint in mints %}
+            <div class="history-item border-b last:border-b-0">
+                <div class="flex items-center p-4 cursor-pointer" onclick="this.nextElementSibling.classList.toggle('hidden')">
+                    <div class="image-preview flex-shrink-0 mr-4">
+                        {% if mint.imageFile %}
+                        <img src="/static/Singles/{{ mint.imageFile }}" alt="Mint {{ mint.serial }}"
+                             class="w-8 h-8 object-contain rounded">
+                        <img src="/static/Singles/{{ mint.imageFile }}" class="enlarged-image">
+                        <a href="/static/Singles/{{ mint.imageFile }}" download class="download-btn">Download</a>
+                        {% else %}
+                        <div class="w-8 h-8 bg-gray-200 rounded flex items-center justify-center text-xs text-gray-500">
+                            No Image
+                        </div>
+                        {% endif %}
+                    </div>
+                    <div class="flex-grow">
+                        <p class="text-sm font-medium text-gray-800">
+                            Serial: {{ mint.serial }}
+                        </p>
+                        <p class="text-xs text-gray-500">
+                            Buyer: {{ mint.buyerAddrTruncated }}
+                        </p>
+                    </div>
+                    <p class="text-xs text-gray-500">
+                        {{ mint.confirmedAt | datetimeformat('%Y-%m-%d %H:%M:%S UTC') }}
+                    </p>
+                </div>
+                <div class="hidden bg-gray-50 p-4 text-sm text-gray-600">
+                    <p><strong>Transaction ID:</strong> {{ mint.txid }}</p>
+                    <p><strong>Full Buyer Address:</strong> {{ mint.buyerAddr }}</p>
+                    {% if mint.imageFile %}
+                    <p><strong>Image:</strong> {{ mint.imageFile }}</p>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+            {% if not mints %}
+            <p class="p-4 text-center text-gray-500">No mints found.</p>
+            {% endif %}
+        </div>
+    </div>
+    <script>
+        // Toggle history item details
+        document.querySelectorAll('.history-item > div:first-child').forEach(item => {
+            item.addEventListener('click', () => {
+                const details = item.nextElementSibling;
+                details.classList.toggle('hidden');
+            });
+        });
+    </script>
+</body>
+</html>
