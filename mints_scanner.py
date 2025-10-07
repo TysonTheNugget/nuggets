@@ -26,7 +26,7 @@ SINGLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static',
 os.makedirs(SINGLES_DIR, exist_ok=True)
 MEMPOOL = "https://mempool.space/api"
 BLOCKCHAIR = "https://api.blockchair.com/bitcoin"
-SCAN_SINCE_UNIX = int(os.getenv("SCAN_SINCE_UNIX", "1728284400"))  # Oct 7, 2025 00:00:00 UTC
+SCAN_SINCE_UNIX = int(os.getenv("SCAN_SINCE_UNIX", "1759795200"))  # Oct 7, 2025 00:00:00 UTC
 PNG_TEXT_KEY_HINT = os.getenv("PNG_TEXT_KEY_HINT", "Serial")
 CONTENT_HOSTS = [
     "https://static.unisat.io/content",
@@ -51,13 +51,16 @@ def get_jsonbin():
         )
         r.raise_for_status()
         data = r.json()
-        logger.debug(f"[JSONBin] Raw response: {data}")
+        logger.debug(f"[JSONBin] Raw response type: {type(data)}, content: {data[:200]}...")  # Truncated for logs
         # Handle both dict and list responses
         if isinstance(data, dict):
-            return data.get("record", {}).get("mints", [])
+            record = data.get("record", {})
+            mints = record.get("mints", []) if isinstance(record, dict) else []
         elif isinstance(data, list):
-            return data
-        return []
+            mints = data
+        else:
+            mints = []
+        return mints
     except Exception as e:
         logger.error(f"[JSONBin] Error reading bin: {e}")
         return []
@@ -85,7 +88,7 @@ def fetch_mempool_txs():
         r = session.get(f"{MEMPOOL}/address/{BITCOIN_ADDRESS}/txs/mempool", timeout=10)
         r.raise_for_status()
         data = r.json()
-        logger.debug(f"[Mempool] Raw response: {data}")
+        logger.debug(f"[Mempool] Raw response type: {type(data)}, length: {len(data) if isinstance(data, list) else 'N/A'}")
         return data
     except Exception as e:
         logger.error(f"[Mempool] Error fetching mempool txs: {e}")
@@ -96,11 +99,12 @@ def fetch_chain_txs(pages=100):
     txs = []
     for page in range(pages):
         try:
-            url = f"{BLOCKCHAIR}/transactions?q=recipient({BITCOIN_ADDRESS})&offset={page * 100}&key={BLOCKCHAIR_API_KEY}"
+            # Simplified URL without 'q=' for basic recipient query
+            url = f"{BLOCKCHAIR}/addresses/transactions/{BITCOIN_ADDRESS}?offset={page * 100}&key={BLOCKCHAIR_API_KEY}"
             r = session.get(url, timeout=30)
             r.raise_for_status()
             data = r.json()
-            logger.debug(f"[Blockchair] Page {page} response: {data}")
+            logger.debug(f"[Blockchair] Page {page} response type: {type(data)}, data length: {len(data.get('data', [])) if isinstance(data, dict) else 'N/A'}")
             page_txs = data.get("data", [])
             txs.extend(page_txs)
             if len(page_txs) < 100:
