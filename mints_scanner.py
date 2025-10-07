@@ -26,7 +26,7 @@ SINGLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static',
 os.makedirs(SINGLES_DIR, exist_ok=True)
 MEMPOOL = "https://mempool.space/api"
 BLOCKCHAIR = "https://api.blockchair.com/bitcoin"
-SCAN_SINCE_UNIX = int(os.getenv("SCAN_SINCE_UNIX", "1759795200"))  # Oct 7, 2025 00:00:00 UTC
+SCAN_SINCE_UNIX = int(os.getenv("SCAN_SINCE_UNIX", "1724803200"))  # Aug 27, 2025 00:00:00 UTC
 PNG_TEXT_KEY_HINT = os.getenv("PNG_TEXT_KEY_HINT", "Serial")
 CONTENT_HOSTS = [
     "https://static.unisat.io/content",
@@ -84,7 +84,7 @@ def fetch_mempool_txs():
         return []
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def fetch_chain_txs(pages=1):
+def fetch_chain_txs(pages=50):
     txs = []
     for page in range(pages):
         try:
@@ -92,7 +92,10 @@ def fetch_chain_txs(pages=1):
             r = session.get(url, timeout=30)
             r.raise_for_status()
             data = r.json()
-            txs.extend(data.get("data", []))
+            page_txs = data.get("data", [])
+            txs.extend(page_txs)
+            if len(page_txs) < 100:
+                break
         except Exception as e:
             logger.error(f"[Blockchair] Error fetching chain txs, page {page}: {e}")
             break
@@ -109,22 +112,22 @@ def get_outspends(txid):
         return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def fetch_binary_once(url, headers, timeout_ms=15000):
+def fetch_binary_once(url, headers):
     try:
-        r = session.get(url, headers=headers, timeout=timeout_ms / 1000)
+        r = session.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         return r.content
     except Exception as e:
         logger.error(f"[FetchBinary] Error fetching {url}: {e}")
         raise
 
-async def fetch_binary_with_fallback(inscription_id):
+def fetch_binary_with_fallback(inscription_id):
     errors = []
     for base in CONTENT_HOSTS:
         url = f"{base}/{inscription_id}/content" if "hiro.so" in base else f"{base}/{inscription_id}"
         headers = {"Accept": "image/png,application/octet-stream;q=0.9,*/*;q=0.8"}
         try:
-            buf = await fetch_binary_once(url, headers)
+            buf = fetch_binary_once(url, headers)
             if buf.startswith(PNG_SIG):
                 return buf
             errors.append(f"non-PNG from {base}")
@@ -167,8 +170,8 @@ def parse_png_text(buf):
                         text[k] = f"<zTXt decompress error: {e}>"
         elif type_chunk == "iTXt":
             parts = data.split(b'\x00', 5)
-            if len(parts) == 5:
-                k, comp_flag, comp_method, _, _, payload = parts
+            if len(parts) >= 5:
+                k, comp_flag, comp_method, _, _, payload = parts[:5]
                 try:
                     v = zlib.decompress(payload).decode("utf-8") if comp_flag == b'\x01' else payload.decode("utf-8")
                     text[k.decode("latin1")] = v
@@ -205,38 +208,39 @@ def find_alnum_token(s):
     m = re.search(r'\b[A-Za-z0-9]{10,24}\b', s)
     return m.group(0) if m else None
 
-async def find_png_inscription_id(txid, max_index=5):
+def find_png_inscription_id(txid, max_index=5):
     for i in range(max_index + 1):
         id = f"{txid}i{i}"
         try:
-            buf = await fetch_binary_with_fallback(id)
+            buf = fetch_binary_with_fallback(id)
             if buf.startswith(PNG_SIG):
                 return id
         except:
             continue
     return None
 
-# Fetch mints
-async def scan_transactions(initial=False):
+# Scan transactions
+def scan_transactions(initial=False):
     mints = get_jsonbin() if not initial else []
     seen_set = {m["txid"] for m in mints}
     txs = []
     
     if initial:
         logger.info("[Scan] Performing initial full scan...")
-        chain_txs = await fetch_chain_txs(pages=50)  # Adjust pages as needed
+        chain_txs = fetch_chain_txs(pages=50)  # Adjust pages as needed
         txs = [t for t in chain_txs if t.get("status", {}).get("block_time", 0) >= SCAN_SINCE_UNIX]
     else:
         logger.info("[Scan] Scanning mempool for updates...")
-        txs = await fetch_mempool_txs()
+        txs = fetch_mempool_txs()
     
+    new_mints = 0
     for tx in txs:
         txid = tx.get("txid")
         if not txid or txid in seen_set:
             continue
         
         try:
-            outspends = await get_outspends(txid)
+            outspends = get_outspends(txid)
             if not outspends:
                 continue
             
@@ -251,14 +255,14 @@ async def scan_transactions(initial=False):
             uniq_candidates = list(set(candidates))
             inscription_id = None
             for reveal_txid in uniq_candidates[:1]:  # Limit to first candidate
-                inscription_id = await find_png_inscription_id(reveal_txid)
+                inscription_id = find_png_inscription_id(reveal_txid)
                 if inscription_id:
                     break
             
             if not inscription_id:
                 continue
             
-            buf = await fetch_binary_with_fallback(inscription_id)
+            buf = fetch_binary_with_fallback(inscription_id)
             parsed = parse_png_text(buf)
             text_map = parsed.get("text", {})
             serial = (get_case_insensitive(text_map, PNG_TEXT_KEY_HINT) or
@@ -287,12 +291,13 @@ async def scan_transactions(initial=False):
             }
             mints.append(mint_item)
             seen_set.add(txid)
+            new_mints += 1
             logger.debug(f"[Scan] Added mint: {serial} for tx {txid}")
         
         except Exception as e:
             logger.error(f"[Scan] Error processing tx {txid}: {e}")
     
-    logger.info(f"[Scan] Processed {len(txs)} txs, found {len(mints) - len(seen_set)} new mints")
+    logger.info(f"[Scan] Processed {len(txs)} txs, found {new_mints} new mints")
     mints.sort(key=lambda x: x["confirmedAt"], reverse=True)
     if mints:
         update_jsonbin(mints)
@@ -305,10 +310,10 @@ def update_mints_job():
         existing_mints = get_jsonbin()
         if not existing_mints:
             logger.info("[Scheduler] JSONBin empty, performing initial scan...")
-            asyncio.run(scan_transactions(initial=True))
+            scan_transactions(initial=True)
         else:
             logger.info("[Scheduler] Performing mempool scan...")
-            asyncio.run(scan_transactions(initial=False))
+            scan_transactions(initial=False)
     except Exception as e:
         logger.error(f"[Scheduler] Error in update job: {e}")
 
